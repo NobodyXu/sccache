@@ -21,8 +21,9 @@ use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io;
 use std::path::Path;
+use std::process::{ExitCode, Termination};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg_attr(target_os = "freebsd", path = "build_freebsd.rs")]
@@ -40,34 +41,68 @@ pub const INSECURE_DIST_SERVER_TOKEN: &str = "dangerously_insecure_server";
     all(target_os = "linux", target_arch = "x86_64"),
     target_os = "freebsd"
 ))]
-fn main() {
+fn main() -> ExitCode {
     init_logging();
 
-    let command = match cmdline::try_parse_from(env::args()) {
-        Ok(cmd) => cmd,
-        Err(e) => match e.downcast::<clap::error::Error>() {
+    match do_main() {
+        Ok(val) => val.report(),
+        Err(e) => e.report(),
+    }
+}
+
+struct MainError {
+    exit_code: ExitCode,
+    err: anyhow::Error,
+}
+
+impl MainError {
+    fn parse_err(err: anyhow::Error) -> Self {
+        Self {
+            exit_code: ExitCode::from(1),
+            err,
+        }
+    }
+
+    fn runtime_err(err: anyhow::Error) -> Self {
+        Self {
+            exit_code: ExitCode::from(2),
+            err,
+        }
+    }
+}
+
+impl Termination for MainError {
+    fn report(self) -> ExitCode {
+        match self.err.downcast::<clap::error::Error>() {
             Ok(clap_err) => clap_err.exit(),
             Err(some_other_err) => {
                 println!("sccache-dist: {some_other_err}");
                 for source_err in some_other_err.chain().skip(1) {
                     println!("sccache-dist: caused by: {source_err}");
                 }
-                std::process::exit(1);
             }
-        },
-    };
-
-    std::process::exit(match run(command) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sccache-dist: error: {}", e);
-
-            for e in e.chain().skip(1) {
-                eprintln!("sccache-dist: caused by: {}", e);
-            }
-            2
         }
-    });
+
+        self.exit_code
+    }
+}
+
+fn do_main() -> Result<(), MainError> {
+    let command = cmdline::try_parse_from(env::args()).map_err(MainError::parse_err)?;
+
+    let runtime = tokio::runtime::Runtime::new()
+        .context("Failed to create tokio multi-threaded runtime")
+        .map_err(MainError::runtime_err)?;
+
+    let _runtime_enter_guard = runtime.enter();
+
+    let join_handle = runtime.spawn(async move { run(command) });
+
+    runtime
+        .block_on(join_handle)
+        .context("Main task failed to execute to complete")
+        .and_then(std::convert::identity)
+        .map_err(MainError::runtime_err)
 }
 
 fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
@@ -120,14 +155,14 @@ fn check_jwt_server_token(
         .ok()
 }
 
-fn run(command: Command) -> Result<i32> {
+fn run(command: Command) -> Result<()> {
     match command {
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
             OsRng.fill_bytes(&mut bytes);
             // As long as it can be copied, it doesn't matter if this is base64 or hex etc
             println!("{}", BASE64_URL_SAFE_ENGINE.encode(bytes));
-            Ok(0)
+            Ok(())
         }
         Command::Auth(AuthSubcommand::JwtHS256ServerToken {
             secret_key,
@@ -138,7 +173,7 @@ fn run(command: Command) -> Result<i32> {
             let token = create_jwt_server_token(server_id, &header, &secret_key)
                 .context("Failed to create server token")?;
             println!("{}", token);
-            Ok(0)
+            Ok(())
         }
 
         Command::Scheduler(scheduler_config::Config {

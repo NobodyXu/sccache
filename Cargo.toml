@@ -87,11 +87,13 @@ rouille = { version = "3.5", optional = true, default-features = false, features
 syslog = { version = "6", optional = true }
 void = { version = "1", optional = true }
 version-compare = { version = "0.1.1", optional = true }
+warp = { version = "0.3.4", optional = true, features = ["tls"], default-features = false }
+thiserror = { version = "1.0.40", optional = true }
+chrono = { version = "0.4.24", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.0.10"
 cc = "1.0"
-chrono = "0.4.24"
 itertools = "0.10"
 predicates = "=3.0.2"
 thirtyfour_sync = "0.27"
@@ -137,7 +139,7 @@ unstable = []
 # Enables distributed support in the sccache client
 dist-client = ["flate2", "hyper", "reqwest", "url", "sha2"]
 # Enables the sccache-dist binary
-dist-server = ["jwt", "flate2", "libmount", "nix", "openssl", "reqwest", "rouille", "syslog", "void", "version-compare"]
+dist-server = ["jwt", "flate2", "libmount", "nix", "openssl", "reqwest", "rouille", "syslog", "void", "version-compare", "warp", "thiserror"]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 

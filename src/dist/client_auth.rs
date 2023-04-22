@@ -84,7 +84,6 @@ mod code_grant_pkce {
         html_response, json_response, query_pairs, MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING,
         REDIRECT_WITH_AUTH_JSON,
     };
-    use crate::util::new_reqwest_blocking_client;
     use crate::util::BASE64_URL_SAFE_ENGINE;
     use base64::Engine;
     use futures::channel::oneshot;
@@ -232,7 +231,7 @@ mod code_grant_pkce {
         Ok(response)
     }
 
-    pub fn code_to_token(
+    pub async fn code_to_token(
         token_url: &str,
         client_id: &str,
         code_verifier: &str,
@@ -246,8 +245,8 @@ mod code_grant_pkce {
             grant_type: GRANT_TYPE_PARAM_VALUE,
             redirect_uri,
         };
-        let client = new_reqwest_blocking_client();
-        let res = client.post(token_url).json(&token_request).send()?;
+        let client = reqwest::Client::new();
+        let res = client.post(token_url).json(&token_request).send().await?;
         if !res.status().is_success() {
             bail!(
                 "Sending code to {} failed, HTTP error: {}",
@@ -258,6 +257,7 @@ mod code_grant_pkce {
 
         let (token, expires_at) = handle_token_response(
             res.json()
+                .await
                 .context("Failed to parse token response as JSON")?,
         )?;
         if expires_at - Instant::now() < MIN_TOKEN_VALIDITY {
@@ -509,10 +509,9 @@ pub fn get_token_oauth2_code_grant_pkce(
     token_url: &str,
 ) -> Result<String> {
     let runtime = Runtime::new()?;
-    let builder = {
-        let _guard = runtime.enter();
-        try_bind()?
-    };
+    let _guard = runtime.enter();
+
+    let builder = try_bind()?;
     let server = builder.serve(make_service!(code_grant_pkce::serve));
 
     let port = server.local_addr().port();
@@ -543,21 +542,26 @@ pub fn get_token_oauth2_code_grant_pkce(
     };
     *code_grant_pkce::STATE.lock().unwrap() = Some(state);
 
-    runtime.block_on(server.with_graceful_shutdown(async move {
-        if let Err(e) = shutdown_rx.await {
-            warn!(
-                "Something went wrong while waiting for auth server shutdown: {}",
-                e
-            )
-        }
-    }))?;
+    runtime.block_on(async move {
+        server
+            .with_graceful_shutdown(async move {
+                if let Err(e) = shutdown_rx.await {
+                    warn!(
+                        "Something went wrong while waiting for auth server shutdown: {}",
+                        e
+                    )
+                }
+            })
+            .await?;
 
-    info!("Server finished, using code to request token");
-    let code = code_rx
-        .try_recv()
-        .expect("Hyper shutdown but code not available - internal error");
-    code_grant_pkce::code_to_token(token_url, client_id, &verifier, &code, &redirect_uri)
-        .context("Failed to convert oauth2 code into a token")
+        info!("Server finished, using code to request token");
+        let code = code_rx
+            .try_recv()
+            .expect("Hyper shutdown but code not available - internal error");
+        code_grant_pkce::code_to_token(token_url, client_id, &verifier, &code, &redirect_uri)
+            .await
+            .context("Failed to convert oauth2 code into a token")
+    })
 }
 
 // https://auth0.com/docs/api-auth/tutorials/implicit-grant

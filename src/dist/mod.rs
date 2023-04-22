@@ -21,10 +21,13 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process;
 use std::str::FromStr;
 #[cfg(feature = "dist-server")]
 use std::sync::Mutex;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::errors::*;
 
@@ -607,10 +610,23 @@ pub struct BuildResult {
 // http implementation) they need to be public, which has knock-on effects for private
 // structs
 
-pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
-impl<'a> Read for ToolchainReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+pub struct ToolchainReader<'a>(Pin<Box<dyn AsyncBufRead + Send + 'a>>);
+impl<'a> AsyncBufRead for ToolchainReader<'a> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        Pin::new(&mut Pin::into_inner(self).0).poll_fill_buf(cx)
+    }
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        Pin::new(&mut Pin::into_inner(self).0).consume(amt)
+    }
+}
+
+impl<'a> AsyncRead for ToolchainReader<'a> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut Pin::into_inner(self).0).poll_read(cx, buf)
     }
 }
 
@@ -625,9 +641,10 @@ impl<'a> Read for InputsReader<'a> {
 type ExtResult<T, E> = ::std::result::Result<T, E>;
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait SchedulerOutgoing {
     // To Server
-    fn do_assign_job(
+    async fn do_assign_job(
         &self,
         server_id: ServerId,
         job_id: JobId,
@@ -637,22 +654,28 @@ pub trait SchedulerOutgoing {
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait ServerOutgoing {
     // To Scheduler
-    fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
+    async fn do_update_job_state(
+        &self,
+        job_id: JobId,
+        state: JobState,
+    ) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens
 #[cfg(feature = "dist-server")]
-pub trait JobAuthorizer: Send {
+pub trait JobAuthorizer: Send + Sync {
     fn generate_token(&self, job_id: JobId) -> Result<String>;
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait SchedulerIncoming: Send + Sync {
     // From Client
-    fn handle_alloc_job(
+    async fn handle_alloc_job(
         &self,
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
@@ -677,18 +700,23 @@ pub trait SchedulerIncoming: Send + Sync {
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait ServerIncoming: Send + Sync {
     // From Scheduler
-    fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
+    async fn handle_assign_job(
+        &self,
+        job_id: JobId,
+        tc: Toolchain,
+    ) -> ExtResult<AssignJobResult, Error>;
     // From Client
-    fn handle_submit_toolchain(
+    async fn handle_submit_toolchain(
         &self,
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         tc_rdr: ToolchainReader<'_>,
     ) -> ExtResult<SubmitToolchainResult, Error>;
     // From Client
-    fn handle_run_job(
+    async fn handle_run_job(
         &self,
         requester: &dyn ServerOutgoing,
         job_id: JobId,
@@ -699,9 +727,10 @@ pub trait ServerIncoming: Send + Sync {
 }
 
 #[cfg(feature = "dist-server")]
+#[async_trait]
 pub trait BuilderIncoming: Send + Sync {
     // From Server
-    fn run_build(
+    async fn run_build(
         &self,
         toolchain: Toolchain,
         command: CompileCommand,
